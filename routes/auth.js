@@ -3,9 +3,11 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const db = require("../database");
 const { sendVerificationEmail } = require("../utils/mailer");
+const { OAuth2Client } = require("google-auth-library");
 require("dotenv").config();
 
 const router = express.Router();
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Cadastro
 router.post("/register", async (req, res) => {
@@ -35,7 +37,7 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// Login
+// Login normal
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Preencha todos os campos." });
@@ -66,6 +68,41 @@ router.post("/login", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Erro no servidor." });
+  }
+});
+
+// Login via Google
+router.post("/google", async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: "Código não fornecido." });
+
+  try {
+    const { tokens } = await googleClient.getToken(code);
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    const { email, name, picture } = payload;
+
+    // Verifica se o usuário já existe
+    let { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
+    let user = rows[0];
+
+    if (!user) {
+      // Cria novo usuário
+      const result = await db.query(
+        "INSERT INTO users (name,email,photo,verified) VALUES ($1,$2,$3,true) RETURNING *",
+        [name, email, picture]
+      );
+      user = result.rows[0];
+    }
+
+    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: "1d" });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, photo: user.photo } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro ao autenticar via Google." });
   }
 });
 
