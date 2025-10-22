@@ -1,27 +1,64 @@
 import express from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import pool from "../database";
+import fetch from "node-fetch"; // para requisições ao Google
+import db from "../database"; // sua conexão PostgreSQL
 import { sendVerificationEmail } from "../utils/mailer";
-import fetch from "node-fetch";
+import dotenv from "dotenv";
 
+dotenv.config();
 const router = express.Router();
 
-// Cadastro
-router.post("/register", async (req, res) => {
-  const { name, email, password, photo } = req.body;
-  if (!name || !email || !password)
-    return res.status(400).json({ error: "Preencha todos os campos." });
+// === LOGIN NORMAL ===
+router.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Preencha todos os campos." });
 
   try {
-    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-    if (rows.length) return res.status(400).json({ error: "E-mail já cadastrado." });
+    const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
+    const user = rows[0];
+    if (!user) return res.status(400).json({ error: "Usuário não encontrado." });
+
+    const valid = bcrypt.compareSync(password, user.password);
+    if (!valid) return res.status(400).json({ error: "Senha incorreta." });
+
+    if (!user.verified) {
+      const now = Date.now();
+      let code = user.verification_code;
+      let expires = user.verification_expires;
+
+      if (!code || !expires || now > expires) {
+        code = Math.floor(1000000 + Math.random() * 9000000).toString();
+        expires = now + 15 * 60 * 1000;
+        await db.query("UPDATE users SET verification_code=$1, verification_expires=$2 WHERE id=$3", [code, expires, user.id]);
+      }
+
+      await sendVerificationEmail(email, code);
+      return res.json({ verify: true, message: "Verifique seu email." });
+    }
+
+    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: "1d" });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, photo: user.photo } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro no servidor." });
+  }
+});
+
+// === REGISTRO NORMAL ===
+router.post("/register", async (req, res) => {
+  const { name, email, password, photo } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ error: "Preencha todos os campos." });
+
+  try {
+    const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
+    if (rows.length > 0) return res.status(400).json({ error: "E-mail já cadastrado." });
 
     const hash = bcrypt.hashSync(password, 10);
     const code = Math.floor(1000000 + Math.random() * 9000000).toString();
     const expires = Date.now() + 15 * 60 * 1000;
 
-    const result = await pool.query(
+    const result = await db.query(
       `INSERT INTO users (name,email,password,photo,verification_code,verification_expires,verified)
        VALUES ($1,$2,$3,$4,$5,$6,false) RETURNING id`,
       [name, email, hash, photo || null, code, expires]
@@ -35,80 +72,56 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// Login normal
-router.post("/login", async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "Preencha todos os campos." });
-
-  try {
-    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-    const user = rows[0];
-    if (!user) return res.status(400).json({ error: "Usuário não encontrado." });
-    if (!bcrypt.compareSync(password, user.password)) return res.status(400).json({ error: "Senha incorreta." });
-
-    if (!user.verified) {
-      return res.json({ verify: true, message: "Verifique seu email." });
-    }
-
-    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: "1d" });
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email, photo: user.photo } });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro no servidor." });
-  }
-});
-
-// Login Google OAuth
+// === LOGIN COM GOOGLE ===
 router.post("/google", async (req, res) => {
   const { code } = req.body;
-  if (!code) return res.status(400).json({ error: "Código é obrigatório." });
+  if (!code) return res.status(400).json({ error: "Código OAuth é obrigatório." });
 
   try {
-    // Troca código por token no Google
-    const params = new URLSearchParams();
-    params.append("client_id", "64491740238-adhb7tiv1rreaetehnvdi5qpk4sskd93.apps.googleusercontent.com");
-    params.append("client_secret", "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");
-    params.append("code", code);
-    params.append("grant_type", "authorization_code");
-    params.append("redirect_uri","http://localhost:1173/auth/callback");
-
-    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    // 1️⃣ Troca code por token
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
-      body: params,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id: "64491740238-adhb7tiv1rreaetehnvdi5qpk4sskd93.apps.googleusercontent.com",
+        client_secret: "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",
+        redirect_uri: "http://localhost:5173/auth/callback",
+        grant_type: "authorization_code",
+      }),
     });
-    const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) return res.status(400).json({ error: "Erro ao autenticar Google." });
+    const tokenData = await tokenResponse.json();
+    if (!tokenData.access_token) return res.status(400).json({ error: "Token inválido." });
 
-    // Busca info do usuário
-    const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+    // 2️⃣ Pega dados do usuário
+    const userInfoResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
-    const userData = await userRes.json();
+    const userInfo = await userInfoResponse.json();
 
-    // Checa se já existe no DB
-    let { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [userData.email]);
+    if (!userInfo.email) return res.status(400).json({ error: "Email não retornado pelo Google." });
+
+    // 3️⃣ Cria/atualiza usuário no DB
+    const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [userInfo.email]);
     let user = rows[0];
 
     if (!user) {
-      // Cria usuário se não existir
-      const result = await pool.query(
-        `INSERT INTO users (name,email,photo,verified)
-         VALUES ($1,$2,$3,true) RETURNING *`,
-        [userData.name, userData.email, userData.picture]
+      const result = await db.query(
+        "INSERT INTO users (name,email,photo,verified) VALUES ($1,$2,$3,true) RETURNING *",
+        [userInfo.name, userInfo.email, userInfo.picture || null]
       );
       user = result.rows[0];
     }
 
-    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: "1d" });
+    // 4️⃣ Gera JWT
+    const token = jwt.sign({ id: user.id, email: user.email },import.meta.env.VITE_JWT_SECRET, { expiresIn: "1d" });
+
     res.json({ token, user: { id: user.id, name: user.name, email: user.email, photo: user.photo } });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Erro no login Google." });
+    res.status(500).json({ error: "Erro no login com Google." });
   }
 });
-
-
-
 
 // Verificação de email
 router.post("/verify", async (req, res) => {
@@ -131,59 +144,59 @@ router.post("/verify", async (req, res) => {
   }
 });
 
-// // Buscar perfil
-// router.get("/profile", async (req, res) => {
-//   const { email } = req.query;
-//   if (!email) return res.status(400).json({ error: "Email é obrigatório." });
+// Buscar perfil
+router.get("/profile", async (req, res) => {
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: "Email é obrigatório." });
 
-//   try {
-//     const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE email=$1", [email]);
-//     const user = rows[0];
-//     if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
-//     res.json(user);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: "Erro no servidor." });
-//   }
-// });
+  try {
+    const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE email=$1", [email]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
+    res.json(user);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro no servidor." });
+  }
+});
 
-// // Buscar usuários
-// router.get("/users", async (req, res) => {
-//   try {
-//     const { rows } = await db.query("SELECT id,name,email,photo FROM users");
-//     res.json(rows);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: "Erro no servidor." });
-//   }
-// });
+// Buscar usuários
+router.get("/users", async (req, res) => {
+  try {
+    const { rows } = await db.query("SELECT id,name,email,photo FROM users");
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro no servidor." });
+  }
+});
 
-// // Buscar usuários
-// router.get("/users/:id", async (req, res) => {
-//   const { id } = req.params;
-//   try {
-//     const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE id=$1", [id]);
-//     const user = rows[0];
-//     if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
-//     res.json(user);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: "Erro no servidor." });
-//   }
-// });
+// Buscar usuários
+router.get("/users/:id", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE id=$1", [id]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
+    res.json(user);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro no servidor." });
+  }
+});
 
-// // Buscar usuários
-// router.get("/users/:id/verify", async (req, res) => {
-//   const { id } = req.params;
-//   try {
-//     const { rows } = await db.query("SELECT id,name,email,photo,verified FROM users WHERE id=$1", [id]);
-//     const user = rows[0];
-//     if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
-//     res.json(user);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: "Erro no servidor." });
-//   }
-// });
+// Buscar usuários
+router.get("/users/:id/verify", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await db.query("SELECT id,name,email,photo,verified FROM users WHERE id=$1", [id]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
+    res.json(user);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro no servidor." });
+  }
+});
 
- module.exports = router;
+module.exports = router;
