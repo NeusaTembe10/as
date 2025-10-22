@@ -1,15 +1,13 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const db = require("../database"); // PostgreSQL
+const db = require("../database"); // assume que aqui você exporta a pool do pg
 const { sendVerificationEmail } = require("../utils/mailer");
-const { OAuth2Client } = require("google-auth-library");
 require("dotenv").config();
 
 const router = express.Router();
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// ===== Cadastro =====
+// Cadastro
 router.post("/register", async (req, res) => {
   const { name, email, password, photo } = req.body;
   if (!name || !email || !password)
@@ -37,7 +35,7 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// ===== Login normal =====
+// Login
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Preencha todos os campos." });
@@ -71,41 +69,7 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// ===== Login via Google =====
-router.post("/google", async (req, res) => {
-  const { tokenId } = req.body;
-  if (!tokenId) return res.status(400).json({ error: "Token do Google é obrigatório." });
-
-  try {
-    const ticket = await googleClient.verifyIdToken({
-      idToken: tokenId,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-
-    const payload = ticket.getPayload();
-    const { email, name, picture } = payload;
-
-    let { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
-    let user = rows[0];
-
-    if (!user) {
-      const result = await db.query(
-        `INSERT INTO users (name, email, password, photo, verified) 
-         VALUES ($1, $2, $3, $4, true) RETURNING *`,
-        [name, email, "GOOGLE_AUTH", picture]
-      );
-      user = result.rows[0];
-    }
-
-    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: "1d" });
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email, photo: user.photo } });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro ao autenticar com Google." });
-  }
-});
-
-// ===== Verificação de email =====
+// Verificação de email
 router.post("/verify", async (req, res) => {
   const { email, code } = req.body;
   if (!email || !code) return res.status(400).json({ error: "Email e código obrigatórios." });
@@ -126,7 +90,7 @@ router.post("/verify", async (req, res) => {
   }
 });
 
-// ===== Buscar perfil =====
+// Buscar perfil
 router.get("/profile", async (req, res) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: "Email é obrigatório." });
