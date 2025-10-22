@@ -1,15 +1,43 @@
-import express from "express";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import fetch from "node-fetch"; // para requisições ao Google
-import db from "../database"; // sua conexão PostgreSQL
-import { sendVerificationEmail } from "../utils/mailer";
-import dotenv from "dotenv";
+const express = require("express");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const db = require("../database"); // PostgreSQL
+const { sendVerificationEmail } = require("../utils/mailer");
+const { OAuth2Client } = require("google-auth-library");
+require("dotenv").config();
 
-dotenv.config();
 const router = express.Router();
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// === LOGIN NORMAL ===
+// ===== Cadastro =====
+router.post("/register", async (req, res) => {
+  const { name, email, password, photo } = req.body;
+  if (!name || !email || !password)
+    return res.status(400).json({ error: "Preencha todos os campos." });
+
+  try {
+    const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
+    if (rows.length > 0) return res.status(400).json({ error: "E-mail já cadastrado." });
+
+    const hash = bcrypt.hashSync(password, 10);
+    const code = Math.floor(1000000 + Math.random() * 9000000).toString();
+    const expires = Date.now() + 15 * 60 * 1000;
+
+    const result = await db.query(
+      `INSERT INTO users (name,email,password,photo,verification_code,verification_expires,verified)
+       VALUES ($1,$2,$3,$4,$5,$6,false) RETURNING id`,
+      [name, email, hash, photo || null, code, expires]
+    );
+
+    await sendVerificationEmail(email, code);
+    res.json({ success: true, userId: result.rows[0].id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro no servidor." });
+  }
+});
+
+// ===== Login normal =====
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Preencha todos os campos." });
@@ -18,9 +46,7 @@ router.post("/login", async (req, res) => {
     const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
     const user = rows[0];
     if (!user) return res.status(400).json({ error: "Usuário não encontrado." });
-
-    const valid = bcrypt.compareSync(password, user.password);
-    if (!valid) return res.status(400).json({ error: "Senha incorreta." });
+    if (!bcrypt.compareSync(password, user.password)) return res.status(400).json({ error: "Senha incorreta." });
 
     if (!user.verified) {
       const now = Date.now();
@@ -45,85 +71,41 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// === REGISTRO NORMAL ===
-router.post("/register", async (req, res) => {
-  const { name, email, password, photo } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ error: "Preencha todos os campos." });
-
-  try {
-    const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
-    if (rows.length > 0) return res.status(400).json({ error: "E-mail já cadastrado." });
-
-    const hash = bcrypt.hashSync(password, 10);
-    const code = Math.floor(1000000 + Math.random() * 9000000).toString();
-    const expires = Date.now() + 15 * 60 * 1000;
-
-    const result = await db.query(
-      `INSERT INTO users (name,email,password,photo,verification_code,verification_expires,verified)
-       VALUES ($1,$2,$3,$4,$5,$6,false) RETURNING id`,
-      [name, email, hash, photo || null, code, expires]
-    );
-
-    await sendVerificationEmail(email, code);
-    res.json({ success: true, userId: result.rows[0].id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro no servidor." });
-  }
-});
-
-// === LOGIN COM GOOGLE ===
+// ===== Login via Google =====
 router.post("/google", async (req, res) => {
-  const { code } = req.body;
-  if (!code) return res.status(400).json({ error: "Código OAuth é obrigatório." });
+  const { tokenId } = req.body;
+  if (!tokenId) return res.status(400).json({ error: "Token do Google é obrigatório." });
 
   try {
-    // 1️⃣ Troca code por token
-    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        code,
-        client_id: "64491740238-adhb7tiv1rreaetehnvdi5qpk4sskd93.apps.googleusercontent.com",
-        client_secret: "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",
-        redirect_uri: "http://localhost:5173/auth/callback",
-        grant_type: "authorization_code",
-      }),
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokenId,
+      audience: process.env.GOOGLE_CLIENT_ID,
     });
-    const tokenData = await tokenResponse.json();
-    if (!tokenData.access_token) return res.status(400).json({ error: "Token inválido." });
 
-    // 2️⃣ Pega dados do usuário
-    const userInfoResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` },
-    });
-    const userInfo = await userInfoResponse.json();
+    const payload = ticket.getPayload();
+    const { email, name, picture } = payload;
 
-    if (!userInfo.email) return res.status(400).json({ error: "Email não retornado pelo Google." });
-
-    // 3️⃣ Cria/atualiza usuário no DB
-    const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [userInfo.email]);
+    let { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
     let user = rows[0];
 
     if (!user) {
       const result = await db.query(
-        "INSERT INTO users (name,email,photo,verified) VALUES ($1,$2,$3,true) RETURNING *",
-        [userInfo.name, userInfo.email, userInfo.picture || null]
+        `INSERT INTO users (name, email, password, photo, verified) 
+         VALUES ($1, $2, $3, $4, true) RETURNING *`,
+        [name, email, "GOOGLE_AUTH", picture]
       );
       user = result.rows[0];
     }
 
-    // 4️⃣ Gera JWT
-    const token = jwt.sign({ id: user.id, email: user.email },import.meta.env.VITE_JWT_SECRET, { expiresIn: "1d" });
-
+    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: "1d" });
     res.json({ token, user: { id: user.id, name: user.name, email: user.email, photo: user.photo } });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Erro no login com Google." });
+    res.status(500).json({ error: "Erro ao autenticar com Google." });
   }
 });
 
-// Verificação de email
+// ===== Verificação de email =====
 router.post("/verify", async (req, res) => {
   const { email, code } = req.body;
   if (!email || !code) return res.status(400).json({ error: "Email e código obrigatórios." });
@@ -144,52 +126,13 @@ router.post("/verify", async (req, res) => {
   }
 });
 
-// Buscar perfil
+// ===== Buscar perfil =====
 router.get("/profile", async (req, res) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: "Email é obrigatório." });
 
   try {
     const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE email=$1", [email]);
-    const user = rows[0];
-    if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
-    res.json(user);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro no servidor." });
-  }
-});
-
-// Buscar usuários
-router.get("/users", async (req, res) => {
-  try {
-    const { rows } = await db.query("SELECT id,name,email,photo FROM users");
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro no servidor." });
-  }
-});
-
-// Buscar usuários
-router.get("/users/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE id=$1", [id]);
-    const user = rows[0];
-    if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
-    res.json(user);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro no servidor." });
-  }
-});
-
-// Buscar usuários
-router.get("/users/:id/verify", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { rows } = await db.query("SELECT id,name,email,photo,verified FROM users WHERE id=$1", [id]);
     const user = rows[0];
     if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
     res.json(user);
