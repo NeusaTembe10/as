@@ -1,4 +1,5 @@
 const nodemailer = require("nodemailer");
+require("dotenv").config();
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -8,13 +9,15 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-function sendVerificationEmail(to, code) {
-  return transporter.sendMail({
+const sendVerificationEmail = async (email, code) => {
+  const mailOptions = {
     from: process.env.EMAIL_USER,
-    to,
-    subject: "Seu código de verificação",
-    html: `<p>Seu código de verificação é: <b>${code}</b><br>Expira em 15 minutos.</p>`,
-  });
-}
+    to: email,
+    subject: "Código de verificação",
+    text: `Seu código de verificação é: ${code}`,
+  };
+
+  return transporter.sendMail(mailOptions);
+};
 
 module.exports = { sendVerificationEmail };

@@ -1,45 +1,60 @@
-const Database = require("better-sqlite3");
-const db = new Database("database.db");
-module.exports = db;
+const { Pool } = require("pg");
+require("dotenv").config();
 
-db.exec("PRAGMA foreign_keys = ON");
-
-db.serialize(() => {
-  // Tabela de usuários
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    photo TEXT,
-    verified INTEGER DEFAULT 0,
-    verification_code TEXT,
-    verification_expires INTEGER
-  )`);
-
-  // Tabela de admin
-  db.run(`CREATE TABLE IF NOT EXISTS admin (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT
-  )`);
-
-  // Tabela de categorias
-  db.run(`CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT,
-    name TEXT
-  )`);
-
-  // Insere admin padrão se não existir
-  db.get("SELECT * FROM admin WHERE username = ?", ["ADMin"], (err, row) => {
-    if (!row) {
-      db.run("INSERT INTO admin (username, password) VALUES (?, ?)", [
-        "ADMin",
-        "1A5S8",
-      ]);
-    }
-  });
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
 
+// Criação das tabelas
+const createTables = async () => {
+  try {
+    // Usuários
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(100) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        photo TEXT,
+        verified BOOLEAN DEFAULT FALSE,
+        verification_code VARCHAR(10),
+        verification_expires BIGINT
+      )
+    `);
+
+    // Admin
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS admin (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) UNIQUE,
+        password VARCHAR(255)
+      )
+    `);
+
+    // Categorias
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS categories (
+        id SERIAL PRIMARY KEY,
+        type VARCHAR(50),
+        name VARCHAR(100)
+      )
+    `);
+
+    // Insere admin padrão se não existir
+    const result = await db.query(`SELECT * FROM admin WHERE username = $1`, ["ADMin"]);
+    if (result.rows.length === 0) {
+      await db.query(`INSERT INTO admin (username, password) VALUES ($1, $2)`, ["ADMin", "1A5S8"]);
+    }
+
+    console.log("Tabelas criadas com sucesso!");
+  } catch (err) {
+    console.error("Erro ao criar tabelas:", err);
+  }
+};
+
+// Executa a criação das tabelas ao iniciar
+createTables();
+
 module.exports = db;
+ 
