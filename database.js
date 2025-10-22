@@ -1,13 +1,8 @@
-const sqlite3 = require("sqlite3").verbose();
-const path = require("path");
+const Database = require("better-sqlite3");
+const db = new Database("database.db");
+module.exports = db;
 
-const db = new sqlite3.Database(path.resolve(__dirname, "main.db"), (err) => {
-  if (err) {
-    console.error("Erro ao conectar ao banco de dados:", err);
-  } else {
-    console.log("Conectado ao banco de dados SQLite.");
-  }
-});
+db.exec("PRAGMA foreign_keys = ON");
 
 db.serialize(() => {
   // Tabela de usuários
