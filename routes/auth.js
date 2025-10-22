@@ -1,13 +1,11 @@
-const express = require("express");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const db = require("../database");
-const { sendVerificationEmail } = require("../utils/mailer");
-const { OAuth2Client } = require("google-auth-library");
-require("dotenv").config();
+import express from "express";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import pool from "../database";
+import { sendVerificationEmail } from "../utils/mailer";
+import fetch from "node-fetch";
 
 const router = express.Router();
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Cadastro
 router.post("/register", async (req, res) => {
@@ -16,14 +14,14 @@ router.post("/register", async (req, res) => {
     return res.status(400).json({ error: "Preencha todos os campos." });
 
   try {
-    const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
-    if (rows.length > 0) return res.status(400).json({ error: "E-mail já cadastrado." });
+    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    if (rows.length) return res.status(400).json({ error: "E-mail já cadastrado." });
 
     const hash = bcrypt.hashSync(password, 10);
     const code = Math.floor(1000000 + Math.random() * 9000000).toString();
     const expires = Date.now() + 15 * 60 * 1000;
 
-    const result = await db.query(
+    const result = await pool.query(
       `INSERT INTO users (name,email,password,photo,verification_code,verification_expires,verified)
        VALUES ($1,$2,$3,$4,$5,$6,false) RETURNING id`,
       [name, email, hash, photo || null, code, expires]
@@ -43,23 +41,12 @@ router.post("/login", async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: "Preencha todos os campos." });
 
   try {
-    const { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
+    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
     const user = rows[0];
     if (!user) return res.status(400).json({ error: "Usuário não encontrado." });
     if (!bcrypt.compareSync(password, user.password)) return res.status(400).json({ error: "Senha incorreta." });
 
     if (!user.verified) {
-      const now = Date.now();
-      let code = user.verification_code;
-      let expires = user.verification_expires;
-
-      if (!code || !expires || now > expires) {
-        code = Math.floor(1000000 + Math.random() * 9000000).toString();
-        expires = now + 15 * 60 * 1000;
-        await db.query("UPDATE users SET verification_code=$1, verification_expires=$2 WHERE id=$3", [code, expires, user.id]);
-      }
-
-      await sendVerificationEmail(email, code);
       return res.json({ verify: true, message: "Verifique seu email." });
     }
 
@@ -71,29 +58,43 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// Login via Google
+// Login Google OAuth
 router.post("/google", async (req, res) => {
   const { code } = req.body;
-  if (!code) return res.status(400).json({ error: "Código não fornecido." });
+  if (!code) return res.status(400).json({ error: "Código é obrigatório." });
 
   try {
-    const { tokens } = await googleClient.getToken(code);
-    const ticket = await googleClient.verifyIdToken({
-      idToken: tokens.id_token,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-    const { email, name, picture } = payload;
+    // Troca código por token no Google
+    const params = new URLSearchParams();
+    params.append("client_id", "64491740238-adhb7tiv1rreaetehnvdi5qpk4sskd93.apps.googleusercontent.com");
+    params.append("client_secret", "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");
+    params.append("code", code);
+    params.append("grant_type", "authorization_code");
+    params.append("redirect_uri","http://localhost:1173/auth/callback");
 
-    // Verifica se o usuário já existe
-    let { rows } = await db.query("SELECT * FROM users WHERE email=$1", [email]);
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      body: params,
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) return res.status(400).json({ error: "Erro ao autenticar Google." });
+
+    // Busca info do usuário
+    const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const userData = await userRes.json();
+
+    // Checa se já existe no DB
+    let { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [userData.email]);
     let user = rows[0];
 
     if (!user) {
-      // Cria novo usuário
-      const result = await db.query(
-        "INSERT INTO users (name,email,photo,verified) VALUES ($1,$2,$3,true) RETURNING *",
-        [name, email, picture]
+      // Cria usuário se não existir
+      const result = await pool.query(
+        `INSERT INTO users (name,email,photo,verified)
+         VALUES ($1,$2,$3,true) RETURNING *`,
+        [userData.name, userData.email, userData.picture]
       );
       user = result.rows[0];
     }
@@ -102,9 +103,12 @@ router.post("/google", async (req, res) => {
     res.json({ token, user: { id: user.id, name: user.name, email: user.email, photo: user.photo } });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Erro ao autenticar via Google." });
+    res.status(500).json({ error: "Erro no login Google." });
   }
 });
+
+
+
 
 // Verificação de email
 router.post("/verify", async (req, res) => {
@@ -127,20 +131,59 @@ router.post("/verify", async (req, res) => {
   }
 });
 
-// Buscar perfil
-router.get("/profile", async (req, res) => {
-  const { email } = req.query;
-  if (!email) return res.status(400).json({ error: "Email é obrigatório." });
+// // Buscar perfil
+// router.get("/profile", async (req, res) => {
+//   const { email } = req.query;
+//   if (!email) return res.status(400).json({ error: "Email é obrigatório." });
 
-  try {
-    const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE email=$1", [email]);
-    const user = rows[0];
-    if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
-    res.json(user);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Erro no servidor." });
-  }
-});
+//   try {
+//     const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE email=$1", [email]);
+//     const user = rows[0];
+//     if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
+//     res.json(user);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ error: "Erro no servidor." });
+//   }
+// });
 
-module.exports = router;
+// // Buscar usuários
+// router.get("/users", async (req, res) => {
+//   try {
+//     const { rows } = await db.query("SELECT id,name,email,photo FROM users");
+//     res.json(rows);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ error: "Erro no servidor." });
+//   }
+// });
+
+// // Buscar usuários
+// router.get("/users/:id", async (req, res) => {
+//   const { id } = req.params;
+//   try {
+//     const { rows } = await db.query("SELECT id,name,email,photo FROM users WHERE id=$1", [id]);
+//     const user = rows[0];
+//     if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
+//     res.json(user);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ error: "Erro no servidor." });
+//   }
+// });
+
+// // Buscar usuários
+// router.get("/users/:id/verify", async (req, res) => {
+//   const { id } = req.params;
+//   try {
+//     const { rows } = await db.query("SELECT id,name,email,photo,verified FROM users WHERE id=$1", [id]);
+//     const user = rows[0];
+//     if (!user) return res.status(404).json({ error: "Usuário não encontrado." });
+//     res.json(user);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ error: "Erro no servidor." });
+//   }
+// });
+
+ module.exports = router;
