@@ -11,8 +11,6 @@
     "type": "git",
     "url": "git+https://github.com/NeusaTembe10/as.git"
   },
-  
-
   "license": "ISC",
   "author": "AS",
   "type": "commonjs",
@@ -23,6 +21,7 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
+    "axios": "^1.13.2",
     "b": "^2.0.1",
     "bcryptjs": "^3.0.2",
     "better-sqlite3": "^12.4.1",
